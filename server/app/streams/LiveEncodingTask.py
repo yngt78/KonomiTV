@@ -29,6 +29,7 @@ from app.constants import (
     QUALITY_TYPES,
 )
 from app.models.Channel import Channel
+from app.streams.H264ParameterSetInjector import H264ParameterSetInjector
 from app.streams.LivePSIDataArchiver import LivePSIDataArchiver
 from app.utils import GetMirakurunAPIEndpointURL
 from app.utils.edcb.EDCBTuner import EDCBTuner
@@ -993,6 +994,11 @@ class LiveEncodingTask:
             ## Unix Time とかではないので注意
             chunk_written_at: float = 0
 
+            # ハードウェアエンコーダー (h264_v4l2m2m) が出力しない SPS/PPS を I フレームごとに注入する
+            ## このエンコーダーは SPS/PPS をストリームの先頭でしか出力しないため、
+            ## 再生中のストリームに後から接続したクライアントは映像をデコードできない (音声だけになる)
+            parameter_set_injector = H264ParameterSetInjector()
+
             # Writer の排他ロック
             ## タスク間共有の変数を Writer() タスクと SubWriter() タスクの両方から読み書きするため、
             ## chunk_buffer / chunk_written_at にアクセスする際は排他ロックを掛けておく必要がある
@@ -1011,11 +1017,15 @@ class LiveEncodingTask:
                         ## read() ではなく厳密な readexactly() を使わないとぴったり 188 bytes にならない場合がある
                         chunk = await cast(asyncio.StreamReader, encoder.stdout).readexactly(ts.PACKET_SIZE)
 
+                        # I フレームの先頭に SPS/PPS を注入する
+                        ## 後から接続したクライアントでも映像をデコードできるようにするため
+                        rewritten_chunk = b''.join(parameter_set_injector.process(chunk))
+
                         # 同時に chunk_buffer / chunk_written_at にアクセスするタスクが1つだけであることを保証する (排他ロック)
                         async with writer_lock:
 
                             # 188 bytes ごとに区切られた、エンコーダーの出力のチャンクをバッファに貯める
-                            chunk_buffer += chunk
+                            chunk_buffer += rewritten_chunk
 
                             # チャンクバッファが 65536 bytes (64KB) 以上になった時のみ
                             if len(chunk_buffer) >= 65536:
