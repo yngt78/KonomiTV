@@ -164,6 +164,18 @@ class VideoEncodingTask:
              self.video_stream.recorded_program.recorded_video.video_resolution_height == 1080):
             video_width = 1920
 
+        ## h264_v4l2m2m は幅が 64 の倍数でない 1440x1080 では出力が破損するため、
+        ## HW エンコーダ使用時は標準サイズの 1920x1080 に拡大する
+        if use_hw_encoder is True and video_width == 1440 and video_height == 1080:
+            video_width = 1920
+
+        ## h264_v4l2m2m は幅が 64 の倍数でない解像度 (1440x810 など) で出力が破損するため、
+        ## HW エンコーダ使用時は幅を 64 の倍数に切り上げ、アスペクト比を保つように高さも調整する
+        if use_hw_encoder is True and video_width % 64 != 0:
+            aspect_ratio = video_height / video_width
+            video_width = ((video_width + 63) // 64) * 64
+            video_height = int(round(video_width * aspect_ratio / 2)) * 2
+
         ## インターレース映像のみ
         if self.video_stream.recorded_program.recorded_video.video_scan_type == 'Interlaced':
             ## インターレース解除 (60i → 60p (フレームレート: 60fps))
@@ -186,6 +198,12 @@ class VideoEncodingTask:
             int_fps = math.ceil(self.video_stream.recorded_program.recorded_video.video_frame_rate)  # 29.97 -> 30
             options.append(f'-vf scale={video_width}:{video_height}')
             options.append(f'-g {int(self.GOP_LENGTH_SECOND * int_fps)}')
+
+        ## h264_v4l2m2m は -aspect を無視して SAR をビットストリームに書き込まない。
+        ## そのため 1440x1080 のような 4:3 の解像度では端末側で 4:3 に潰れて表示される。
+        ## SPS の SAR を明示的に付与して 16:9 で表示させる。
+        if use_hw_encoder is True and video_width * 3 == video_height * 4:
+            options.append('-bsf:v h264_metadata=sample_aspect_ratio=4/3')
 
         # 音声
         ## 音声が 5.1ch かどうかに関わらず、ステレオにダウンミックスする
