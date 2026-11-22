@@ -67,6 +67,21 @@ class PlayerController {
     // ビデオ視聴: ビデオストリームのアクティブ状態を維持するために Keep-Alive API にリクエストを送るインターバルのキャンセルする関数
     private video_keep_alive_interval_timer_cancel: (() => void) | null = null;
 
+    // ライブ視聴: 再生位置がバッファ範囲外で止まっている場合に、ライブエッジへ強制シークするインターバルの ID
+    private live_stall_jump_timer_id: number | null = null;
+
+    // ライブ視聴: recoverPlayback() が多重実行されているか
+    // Safari では 'playing' イベントが連続発火し、recoverPlayback() が重なって pause()/play() を連打すると
+    // 再生バッファが育たず「バッファ待ちが永遠に続く」状態になるため、実行中は再入を防ぐ
+    private is_recovering_playback = false;
+
+    // ライブ視聴: 強制シークでも復旧しなかった際にプレイヤーを自動再起動した時刻の履歴
+    // 再起動を繰り返して無限ループにならないよう、直近 2 分間で最大 3 回までに制限する
+    private live_auto_restart_times: number[] = [];
+
+    // ライブ視聴: 自動再起動の上限に達して復旧できなかったことをユーザーへ通知済みか
+    private live_auto_restart_limit_notified = false;
+
     // setupPlayerContainerResizeHandler() で利用する ResizeObserver
     // 保持しておかないと disconnect() で ResizeObserver を止められない
     private player_container_resize_observer: ResizeObserver | null = null;
@@ -865,34 +880,40 @@ class PlayerController {
             }
             is_player_restarting = true;
 
-            // 現在の再生画質・再生速度・再生位置を取得
-            // この情報がプレイヤー再起動後にレジュームされる
-            const should_resume_quality = event.should_resume_quality !== false;
-            const quality_index = this.player.qualityIndex ?? null;
-            // 画質プロファイルの既定値を優先する場合は直前の画質を引き継がない
-            const current_quality = should_resume_quality === true && this.player.options.video.quality && typeof quality_index === 'number'
-                ? this.player.options.video.quality[quality_index]
-                : null;
-            const current_playback_rate = this.player.video.playbackRate ?? null;
-            const current_time = this.player.video.currentTime ?? null;
+            // destroy() や init() が途中で例外を投げても、以降の再起動要求を無視し続けないようフラグは必ず戻す
+            try {
 
-            // PlayerController 自身を破棄
-            await this.destroy();
+                // 現在の再生画質・再生速度・再生位置を取得
+                // この情報がプレイヤー再起動後にレジュームされる
+                const should_resume_quality = event.should_resume_quality !== false;
+                const quality_index = this.player.qualityIndex ?? null;
+                // 画質プロファイルの既定値を優先する場合は直前の画質を引き継がない
+                const current_quality = should_resume_quality === true && this.player.options.video.quality && typeof quality_index === 'number'
+                    ? this.player.options.video.quality[quality_index]
+                    : null;
+                const current_playback_rate = this.player.video.playbackRate ?? null;
+                const current_time = this.player.video.currentTime ?? null;
 
-            // ライブ視聴時のみ即座に再起動すると諸々問題があるので、少し待つ
-            if (this.playback_mode === 'Live') {
-                await Utils.sleep(0.5);
+                // PlayerController 自身を破棄
+                await this.destroy();
+
+                // ライブ視聴時のみ即座に再起動すると諸々問題があるので、少し待つ
+                if (this.playback_mode === 'Live') {
+                    await Utils.sleep(0.5);
+                }
+
+                // PlayerController 自身を再初期化
+                // 再起動完了時点でこの PlayerRestartRequired のイベントハンドラーは再登録されているはず
+                await this.init({
+                    // 現在の再生画質・再生速度 (ビデオ視聴時のみ)・再生位置 (ビデオ視聴時のみ) を引き継ぐ
+                    default_quality: current_quality ? current_quality.name : null,
+                    playback_rate: this.playback_mode === 'Video' ? current_playback_rate : null,
+                    seek_seconds: this.playback_mode === 'Video' ? current_time : null,
+                });
+
+            } finally {
+                is_player_restarting = false;
             }
-
-            // PlayerController 自身を再初期化
-            // 再起動完了時点でこの PlayerRestartRequired のイベントハンドラーは再登録されているはず
-            await this.init({
-                // 現在の再生画質・再生速度 (ビデオ視聴時のみ)・再生位置 (ビデオ視聴時のみ) を引き継ぐ
-                default_quality: current_quality ? current_quality.name : null,
-                playback_rate: this.playback_mode === 'Video' ? current_playback_rate : null,
-                seek_seconds: this.playback_mode === 'Video' ? current_time : null,
-            });
-            is_player_restarting = false;
 
             // プレイヤー側にイベントの発火元から送られたメッセージ (プレイヤーを再起動中である旨) を通知する
             // 再初期化により、作り直した DPlayer が再び this.player にセットされているはず
@@ -1030,11 +1051,30 @@ class PlayerController {
      * 基本 Safari だとなぜか再生開始がうまく行かないことが多いので（自動再生まわりが影響してる？）、その対策として用意した処理
      */
     private async recoverPlayback(): Promise<void> {
+        // 多重実行されると pause()/play() を連打して再生バッファが育たなくなるため、実行中は新しい呼び出しを無視する
+        if (this.is_recovering_playback === true) return;
+        this.is_recovering_playback = true;
+        try {
+            await this.recoverPlaybackInternal();
+        } finally {
+            this.is_recovering_playback = false;
+        }
+    }
+
+
+    /**
+     * 再生状態の復旧処理の本体 (recoverPlayback() から多重実行を防いで呼び出される)
+     */
+    private async recoverPlaybackInternal(): Promise<void> {
         assert(this.player !== null);
         const player_store = usePlayerStore();
 
         // 1 秒待つ
         await Utils.sleep(1);
+
+        // 待機中にプレイヤーが破棄された場合は何もしない
+        // 破棄済みのプレイヤーに触れると例外になり、再生状態の復旧処理が未処理のまま失敗する
+        if (this.destroyed === true || this.player?.video == null) return;
 
         // この時点で映像が停止していて、かつ readyState が HAVE_FUTURE_DATA な場合、復旧を試みる
         // Safari ではタイミングによっては this.player.video が null になる場合があるらしいので ? を付ける
@@ -1114,6 +1154,86 @@ class PlayerController {
             }, 5 * 1000);
         }
 
+        // ライブ視聴: 再生位置がバッファ範囲の外 (または未確定) で映像が止まっている場合に、
+        // バッファ内 (ライブエッジ付近) へ強制的にシークして再生を再開させる
+        // iOS Safari の ManagedMediaSource では、接続直後や一時停止からの再開時に currentTime が NaN になり、
+        // readyState が HAVE_METADATA (1) のまま上がらないことがある
+        // この状態では mpegts.js の StartupStallJumper も KonomiTV の定期シークも
+        // currentTime との比較が false になるため、どちらも発動しない
+        // そのため currentTime の値に依存せず、readyState とバッファの有無だけで判定する
+        let live_stall_count = 0;
+        let live_stall_jump_count = 0;
+        if (this.playback_mode === 'Live') {
+            this.live_stall_jump_timer_id = window.setInterval(() => {
+                if (this.player === null) return;
+                const video = this.player.video;
+                // 停止中 / データ未到着 / 正常再生中は対象外
+                if (video.paused === true || video.buffered.length === 0 || video.readyState >= 2) {
+                    live_stall_count = 0;
+                    live_stall_jump_count = 0;
+                    return;
+                }
+                live_stall_count++;
+                if (live_stall_count < 3) return;
+                live_stall_count = 0;
+
+                // on_canplay の再生バッファ待ちで playbackRate が 0 のまま固まっている場合は戻す
+                // ただし on_canplay がバッファ調整のために意図的に 0 にしている間 (is_loading) は触らない
+                if (video.playbackRate === 0 && player_store.is_loading === false) {
+                    video.playbackRate = 1;
+                }
+
+                // 強制シークを繰り返しても復旧しない場合は、プレイヤーごと作り直す
+                // MSE の内部状態が壊れているとシークでは復旧できず、プレイヤーの再起動でしか直らないため
+                live_stall_jump_count++;
+                if (live_stall_jump_count > 3) {
+                    live_stall_jump_count = 0;
+                    const now = Date.now();
+                    // 直近 2 分間の自動再起動回数が 3 回未満の場合のみ実行する (無限ループ防止)
+                    this.live_auto_restart_times = this.live_auto_restart_times.filter((time) => now - time < 120 * 1000);
+                    if (this.live_auto_restart_times.length === 0) {
+                        this.live_auto_restart_limit_notified = false;
+                    }
+                    if (this.live_auto_restart_times.length < 3) {
+                        this.live_auto_restart_times.push(now);
+                        console.warn('\u001b[33m[PlayerController] Live playback could not be recovered by seeking. Restarting the player.');
+                        // 再起動 (destroy) が完了するまでの間に、破棄待ちのプレイヤーへ再度シークしないようタイマーを止める
+                        if (this.live_stall_jump_timer_id !== null) {
+                            window.clearInterval(this.live_stall_jump_timer_id);
+                            this.live_stall_jump_timer_id = null;
+                        }
+                        player_store.event_emitter.emit('PlayerRestartRequired', {
+                            message: 'ライブ再生が停止したため、プレイヤーを自動で再起動しています…',
+                            is_error_message: false,
+                        });
+                        return;
+                    }
+                    // 上限に達して自動再起動できない場合は、手動での再起動を促す通知を一度だけ表示する
+                    // (このまま何も表示せず強制シークを続けると、ユーザーには「直らない」としか分からないため)
+                    if (this.live_auto_restart_limit_notified === false) {
+                        this.live_auto_restart_limit_notified = true;
+                        console.warn('\u001b[33m[PlayerController] Live playback could not be recovered. Auto restart limit reached.');
+                        player_store.event_emitter.emit('SendNotification', {
+                            message: 'ライブ再生を自動で復旧できませんでした。プレイヤー右側の再起動ボタンで再起動してください。',
+                            color: '#FF6F6A',
+                        });
+                    }
+                }
+
+                // バッファの末尾付近 (ライブエッジ) を再生位置にする
+                const buffer_start = video.buffered.start(0);
+                const buffer_end = video.buffered.end(video.buffered.length - 1);
+                const seek_target = Math.max(buffer_start, buffer_end - 0.5);
+                console.warn(`\u001b[33m[PlayerController] Live playback is stuck at ${video.currentTime} (readyState: ${video.readyState}). Seeking to ${seek_target}.`);
+                try {
+                    video.currentTime = seek_target;
+                    video.play().catch(() => {});
+                } catch (error) {
+                    console.warn('\u001b[31m[PlayerController] Failed to seek to the live edge.', error);
+                }
+            }, 1000);
+        }
+
         // 再生/停止されたときのイベント
         // デバイスの通知バーからの制御など、ブラウザの画面以外から動画の再生/停止が行われる事もあるため必要
         const on_play_or_pause = () => {
@@ -1166,6 +1286,11 @@ class PlayerController {
 
             // ライブ視聴時のみ
             if (this.playback_mode === 'Live') {
+
+                // 画質切替直後は直前のストリームの状態 (buffered / readyState) が一瞬残ることがあるため、
+                // 強制シークの停止判定をやり直す
+                live_stall_count = 0;
+                live_stall_jump_count = 0;
 
                 // mpegts.js のエラーログハンドラーを登録
                 // 再生中に mpegts.js 内部でエラーが発生した際 (例: デバイスの通信が一時的に切断され、API からのストリーミングが途切れた際) に呼び出される
@@ -1280,8 +1405,11 @@ class PlayerController {
                     // live_playback_buffer_seconds の値は mpegts.js の liveSyncTargetLatency 設定に渡す値と共通
                     const live_playback_buffer_seconds = this.live_playback_buffer_seconds;  // 毎回取得すると負荷が掛かるのでキャッシュする
                     let current_playback_buffer_sec = this.getPlaybackBufferSeconds();
-                    while (current_playback_buffer_sec < live_playback_buffer_seconds) {
+                    // バッファが目標値まで育たない場合に playbackRate=0 のまま固まらないよう、待機時間に上限を設ける
+                    let waited_seconds = 0;
+                    while (current_playback_buffer_sec < live_playback_buffer_seconds && waited_seconds < 6) {
                         await Utils.sleep(0.1);
+                        waited_seconds += 0.1;
                         current_playback_buffer_sec = this.getPlaybackBufferSeconds();
                     }
 
@@ -2125,6 +2253,10 @@ class PlayerController {
         }
 
         // タイマーを破棄
+        if (this.live_stall_jump_timer_id !== null) {
+            window.clearInterval(this.live_stall_jump_timer_id);
+            this.live_stall_jump_timer_id = null;
+        }
         if (this.live_force_seek_interval_timer_cancel !== null) {
             this.live_force_seek_interval_timer_cancel();
             this.live_force_seek_interval_timer_cancel = null;
