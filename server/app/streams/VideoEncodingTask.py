@@ -128,18 +128,32 @@ class VideoEncodingTask:
 
         # 映像
         ## コーデック
+        ## KONOMITV_HW_ENCODER=1 のときは Raspberry Pi のハードウェアエンコーダ
+        ## (bcm2835-codec / h264_v4l2m2m) を使う。1080p は gpu_mem=128 以上が前提。
+        use_hw_encoder = (
+            os.environ.get('KONOMITV_HW_ENCODER', '0') == '1' and
+            QUALITY[quality].is_hevc is False and
+            QUALITY[quality].width * QUALITY[quality].height <= 1920 * 1080
+        )
         if QUALITY[quality].is_hevc is True:
             options.append('-vcodec libx265')  # H.265/HEVC (通信節約モード)
+        elif use_hw_encoder is True:
+            options.append('-vcodec h264_v4l2m2m')  # H.264 (ハードウェアエンコーダ)
         else:
             options.append('-vcodec libx264')  # H.264
 
         ## ビットレートと品質
         options.append(f'-flags +cgop+global_header -vb {QUALITY[quality].video_bitrate} -maxrate {QUALITY[quality].video_bitrate_max}')
-        options.append('-preset veryfast -aspect 16:9 -pix_fmt:v yuv420p')
-        if QUALITY[quality].is_hevc is True:
-            options.append('-profile:v main')
+        if use_hw_encoder is True:
+            ## v4l2m2m は preset / profile に対応していない
+            ## キャプチャバッファを増やさないと "All capture buffers returned to userspace" で詰まる
+            options.append('-aspect 16:9 -pix_fmt:v yuv420p -num_capture_buffers 32')
         else:
-            options.append('-profile:v high')
+            options.append('-preset veryfast -aspect 16:9 -pix_fmt:v yuv420p')
+            if QUALITY[quality].is_hevc is True:
+                options.append('-profile:v main')
+            else:
+                options.append('-profile:v high')
 
         ## 指定された品質の解像度が 1440×1080 (1080p) かつ入力ストリームがフル HD (1920×1080) の場合のみ、
         ## 特別に縦解像度を 1920 に変更してフル HD (1920×1080) でエンコードする
